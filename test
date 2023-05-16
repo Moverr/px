@@ -1,0 +1,278 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:audio_session/audio_session.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_sound/flutter_sound.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:web_socket_channel/io.dart';
+
+///
+const int tSampleRate = 44000;
+typedef _Fn = void Function();
+
+/// Example app.
+class RecordToStreamExample extends StatefulWidget {
+  const RecordToStreamExample({super.key});
+
+  @override
+  _RecordToStreamExampleState createState() => _RecordToStreamExampleState();
+}
+
+class _RecordToStreamExampleState extends State<RecordToStreamExample> {
+  FlutterSoundPlayer? _mPlayer = FlutterSoundPlayer();
+  FlutterSoundRecorder? _mRecorder = FlutterSoundRecorder();
+  bool _mPlayerIsInited = false;
+  bool _mRecorderIsInited = false;
+  bool _mplaybackReady = false;
+  String? _mPath;
+  StreamSubscription? _mRecordingDataSubscription;
+  final _micChunks = BytesBuilder(copy: false);
+  late IOWebSocketChannel channel;
+
+  Future<void> _openRecorder() async {
+    var status = await Permission.microphone.request();
+    if (status != PermissionStatus.granted) {
+      throw RecordingPermissionException('Microphone permission not granted');
+    }
+    await _mRecorder!.openRecorder();
+
+    final session = await AudioSession.instance;
+    await session.configure(AudioSessionConfiguration(
+      avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
+      avAudioSessionCategoryOptions:
+          AVAudioSessionCategoryOptions.allowBluetooth |
+              AVAudioSessionCategoryOptions.defaultToSpeaker,
+      avAudioSessionMode: AVAudioSessionMode.spokenAudio,
+      avAudioSessionRouteSharingPolicy:
+          AVAudioSessionRouteSharingPolicy.defaultPolicy,
+      avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
+      androidAudioAttributes: const AndroidAudioAttributes(
+        contentType: AndroidAudioContentType.speech,
+        flags: AndroidAudioFlags.none,
+        usage: AndroidAudioUsage.voiceCommunication,
+      ),
+      androidAudioFocusGainType: AndroidAudioFocusGainType.gain,
+      androidWillPauseWhenDucked: true,
+    ));
+
+    setState(() {
+      _mRecorderIsInited = true;
+    });
+  }
+
+  void createWebSocketClient() async {
+    channel = IOWebSocketChannel.connect(
+      Uri.parse('ws://192.168.0.101:8001'),
+    );
+
+    //start a connection
+    channel.sink.add(json.encode({"type": "init"}));
+    //join a connection
+    // channel.sink.add(json.encode({"watch": "BDruXAHf-4NqtYK3"}));
+
+    channel.stream.map((data) => jsonDecode(data)).listen(
+      (data) {
+        handleIncomingData(data);
+      },
+      onError: (error) => print(error),
+    );
+  }
+
+  Uint8List _getBinaryData(dynamicList) {
+    List<int> intList =
+        dynamicList.cast<int>().toList(); //This is the magical line.
+    Uint8List data = Uint8List.fromList(intList);
+    return data;
+  }
+
+  handleIncomingData(dynamic data) {
+    setState(() {
+      _micChunks.add(_getBinaryData(data['data']));
+    });
+  }
+
+  void addDataToWebSocketChannel(dynamic data) {
+    channel.sink.add(jsonEncode({
+      'data': data,
+    }));
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    // Be careful : openAudioSession return a Future.
+    // Do not access your FlutterSoundPlayer or FlutterSoundRecorder before the completion of the Future
+    _mPlayer!.openPlayer().then((value) {
+      setState(() {
+        _mPlayerIsInited = true;
+      });
+    });
+    createWebSocketClient();
+    _openRecorder();
+  }
+
+  @override
+  void dispose() {
+    stopPlayer();
+    _mPlayer!.closePlayer();
+    _mPlayer = null;
+
+    stopRecorder();
+    _mRecorder!.closeRecorder();
+    _mRecorder = null;
+    super.dispose();
+  }
+
+  // ----------------------  Here is the code to record to a Stream ------------
+
+  Future<void> record() async {
+    assert(_mRecorderIsInited && _mPlayer!.isStopped);
+    var recordingDataController = StreamController<Food>();
+    _mRecordingDataSubscription =
+        recordingDataController.stream.listen((buffer) {
+      if (buffer is FoodData) {
+        addDataToWebSocketChannel(buffer.data!);
+      }
+    });
+    await _mRecorder!.startRecorder(
+      toStream: recordingDataController.sink,
+      codec: Codec.pcm16,
+      numChannels: 1,
+      sampleRate: tSampleRate,
+    );
+    setState(() {});
+  }
+  // --------------------- (it was very simple, wasn't it ?) -------------------
+
+  Future<void> stopRecorder() async {
+    await _mRecorder!.stopRecorder();
+    if (_mRecordingDataSubscription != null) {
+      await _mRecordingDataSubscription!.cancel();
+      _mRecordingDataSubscription = null;
+    }
+    _mplaybackReady = true;
+  }
+
+  _Fn? getRecorderFn() {
+    if (!_mRecorderIsInited || !_mPlayer!.isStopped) {
+      return null;
+    }
+    return _mRecorder!.isStopped
+        ? record
+        : () {
+            stopRecorder().then((value) => setState(() {}));
+          };
+  }
+
+  void play() async {
+    assert(_mPlayerIsInited &&
+        _mplaybackReady &&
+        _mRecorder!.isStopped &&
+        _mPlayer!.isStopped);
+
+
+
+    await _mPlayer!.startPlayer(
+        fromDataBuffer: _micChunks.takeBytes(),
+        sampleRate: tSampleRate,
+        codec: Codec.pcm16,
+        numChannels: 1,
+        whenFinished: () {
+          setState(() {});
+        }); // The readability of Dart is very special :-(
+    setState(() {});
+  }
+
+  Future<void> stopPlayer() async {
+    await _mPlayer!.stopPlayer();
+  }
+
+  _Fn? getPlaybackFn() {
+    if (!_mPlayerIsInited || !_mplaybackReady || !_mRecorder!.isStopped) {
+      return null;
+    }
+    return _mPlayer!.isStopped
+        ? play
+        : () {
+            stopPlayer().then((value) => setState(() {}));
+          };
+  }
+
+  // ----------------------------------------------------------------------------------------------------------------------
+
+  @override
+  Widget build(BuildContext context) {
+    Widget makeBody() {
+      return Column(
+        children: [
+          Container(
+            margin: const EdgeInsets.all(3),
+            padding: const EdgeInsets.all(3),
+            height: 80,
+            width: double.infinity,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: Color(0xFFFAF0E6),
+              border: Border.all(
+                color: Colors.indigo,
+                width: 3,
+              ),
+            ),
+            child: Row(children: [
+              ElevatedButton(
+                onPressed: getRecorderFn(),
+                //color: Colors.white,
+                //disabledColor: Colors.grey,
+                child: Text(_mRecorder!.isRecording ? 'Stop' : 'Record'),
+              ),
+              SizedBox(
+                width: 20,
+              ),
+              Text(_mRecorder!.isRecording
+                  ? 'Recording in progress'
+                  : 'Recorder is stopped'),
+            ]),
+          ),
+          Container(
+            margin: const EdgeInsets.all(3),
+            padding: const EdgeInsets.all(3),
+            height: 80,
+            width: double.infinity,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: Color(0xFFFAF0E6),
+              border: Border.all(
+                color: Colors.indigo,
+                width: 3,
+              ),
+            ),
+            child: Row(children: [
+              ElevatedButton(
+                onPressed: getPlaybackFn(),
+                //color: Colors.white,
+                //disabledColor: Colors.grey,
+                child: Text(_mPlayer!.isPlaying ? 'Stop' : 'Play'),
+              ),
+              SizedBox(
+                width: 20,
+              ),
+              Text(_mPlayer!.isPlaying
+                  ? 'Playback in progress'
+                  : 'Player is stopped'),
+            ]),
+          ),
+        ],
+      );
+    }
+
+    return Scaffold(
+      backgroundColor: Colors.blue,
+      appBar: AppBar(
+        title: const Text('Record to Stream ex.'),
+      ),
+      body: makeBody(),
+    );
+  }
+}
